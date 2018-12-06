@@ -1,0 +1,59 @@
+//Nominal model
+/*
+	 * theta_dot2n = 0.500*u
+	 * theta_dot1n=theta_dot1n+sampletime*theta_dot2n
+	 * thetan=thetan+sampletime*theta_dot1n
+	 */
+
+`include "controller_defines.v"
+
+module nominal_model(
+	input clk,
+	input rst_n,
+
+	input u_t,
+	output model_u,
+	output model_udot
+);
+
+	//Nominal model variable
+	//sfix17_En12
+	reg signed[15:0] model_u_r;
+	reg signed[16:0] model_udot_r;
+	reg [31:0] theta_dot1n_curr;
+	reg [31:0]theta_dot1n_next;
+	reg [31:0] thetan_curr;
+	reg [31:0] thetan_next;
+	reg [31:0] theta_dot1n;
+	reg [31:0] theta_dot1n_t;
+	reg [31:0] theta_dot2n;
+	reg [31:0] theta_dot2n_t;
+
+	always@(*) begin //TODO: pipeline 
+		theta_dot2n = u_t>>1;
+		theta_dot2n_t = theta_dot2n / `FREQ;
+		theta_dot1n_next = theta_dot1n_curr + theta_dot2n_t;
+		theta_dot1n_t = theta_dot1n / `FREQ;
+		thetan_next = theta_dot1n_t + thetan_curr;
+	end
+
+	always@(posedge clk or negedge rst_n) begin
+		if(!rst_n) begin
+			theta_dot1n_curr <= 0;
+		end
+		else if(clk) begin
+			theta_dot1n_curr <= theta_dot1n_next;
+		end
+	end
+	always@(posedge clk or negedge rst_n) begin
+		if(!rst_n) begin
+			thetan_curr <= 0;
+		end
+		else if(clk) begin
+			thetan_curr <= thetan_next;
+		end
+	end
+	
+	assign model_u = thetan_next;
+	assign model_udot = theta_dot1n_next;
+endmodule

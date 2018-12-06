@@ -1,0 +1,481 @@
+/* 
+ * --------------------
+ * Company					: Shenzhen MileBot Robotics Tech Co., Ltd.
+ * --------------------
+ * Project Name				: SEA
+ * model Name				: Drive_nominal
+ * Description				:
+ * --------------------
+ * Tool Versions			: Quartus II 13.1
+ * Target Device			: Cyclone IV E  EP4CE15F
+ * --------------------
+ * Engineer					: Dayuan
+ * Revision					: V1.0
+ * Created Date				: 2018-11-04
+ * --------------------
+ * Engineer					:
+ * Revision					:
+ * Modified Date			:
+ * --------------------
+ * Additional Comments	: PLUSE_DESIRE
+ * 
+ * --------------------
+ */
+//-------------------------Timescale----------------------------//
+`include "controller_defines.v"
+//------------------------Macro_Define--------------------------//
+/*  
+	 * ---fix-point sfix16_En13  
+	 * ---3.1415(d)(pi)  = 011.0010010000111(b) >= 3.141357421875
+	 * ---6.2831(d)(2pi) = 110.0100100001110(b) >= 6.282958984375
+	 * ---error = 0.000244140625
+	 */
+`define PI 		 (16'b0110010010000111)
+`define PI_2     (16'b1100100100001110)
+//--------------------model_PLUSE---------------------//
+module nominal
+(
+	input cs,
+	input rst_n,
+	input rd,
+	input wr,
+	input clk,
+
+	input rdempty,
+	input [7:0] usedfifo,
+	input [15:0] rddata,
+	input [3:0] addr,
+	input [15:0] indata,
+	input [15:0] backdata,
+
+	output cs_code,
+	output rd_code,
+	output cs_rate,
+	output wr_rate,
+	output pul_enable,
+	output [3:0] outaddr,
+	output [15:0] rate,
+	output [15:0] outdata,
+
+	output rdreq,
+	output rdclk,
+	output fifoclr
+);
+	/*---------Add user variable here---------*/
+	wire rdn,wrn;
+
+	wire clk_h,clk_l;
+	reg clk_c;
+
+	//fifo
+	reg fifo_no_empty;
+	reg rd_req;
+	reg rd_empty;
+	reg rd_clk;
+	reg fifo_clr;
+
+	//encoder
+	localparam delay_vel = 100<<4;
+	reg [(delay_vel)-1:0] delay_theta_r;
+	reg cs_code_out;
+	reg rd_code_out;
+	reg[3:0] outaddr_out;
+	reg[15:0] tama_temp,tama_temp_r;
+	reg[15:0] highdata;
+	reg[15:0] lowdata;
+	reg[15:0] insignal;
+	reg[15:0] backsignal;
+
+	//driver
+	reg cs_rate_out;
+	reg wr_rate_out;
+	reg pul_enable_out;
+	reg[15:0] rateout;
+	reg[15:0] u;
+
+	//algorithm
+	wire[31:0] theta_delay, theta_delay_t1, theta_dot;
+	wire[31:0] theta_e, theta_dote, theta_d_a;
+	reg[31:0] theta_d_r1, theta_d_r2;
+	reg[31:0]theta_d_v1, theta_d_v2;
+	wire[31:0] model_u, model_udot;
+	reg[31:0] model_u_r, model_udot_r;
+
+	wire[31:0] u_t;
+
+	reg[31:0] theta_dot_r, theta_e_r, theta_dote_r;
+	wire[31:0] controller_u;
+
+	reg start;
+	reg rdfifobegin;
+	reg used_info;
+	reg[7:0] status;
+	reg[15:0] db_fifo;
+	reg[15:0] dataout;
+	reg[15:0] databuf;
+	reg[15:0] insignalbuf;
+
+	reg[15:0] theta_d;
+	
+	reg[31:0] debug;
+	reg[15:0] debugbuf;
+	reg[15:0] error_cnt;
+	/*---------Add user logic here -------------*/
+	assign rdn = cs|rd;
+	assign wrn = cs|wr;
+
+
+	/* --------- timer -----------------*/
+	control_timer inst1 (clk, rst_n, clk_h, clk_l);
+
+
+	/*---------  model inst----------- */
+	nominal_model_controller inst2 (theta_e, theta_dote, theta_d_a, u_t);
+
+	nominal_model inst3 (clk_c, rst_n, u_t, model_u, model_udot);
+
+	smc_controller inst4 (u_t, theta_dot_r, theta_e_r, theta_dote_r, controller_u);
+
+	//Encoder position and velocity calculated logic
+	always@(posedge clk_c or negedge rst_n)begin
+		if(!rst_n)
+			delay_theta_r <= 0;
+		else if (clk_c)begin
+			delay_theta_r[15:0] <= backsignal;
+			delay_theta_r[(delay_vel)-1:16] <= delay_theta_r[(delay_vel)-17:0];
+		end
+	end
+
+	assign theta_delay = delay_theta_r[(delay_vel)-1:(delay_vel)-16];
+	assign theta_delay_t1 = {1'b0,theta_delay} - {1'b0,backsignal};
+	assign theta_dot = theta_delay_t1 * 7'd100; //sfix24_En13
+
+
+	//Desired position and velocity and accelerate
+	always@(posedge clk_c or negedge rst_n)begin
+		if(!rst_n)begin
+			theta_d_r1 <= 0;
+			theta_d_r2 <= 0;
+		end
+		if(clk_c)begin
+			theta_d_r1 <= theta_d;
+			theta_d_r2 <= theta_d_r1;
+		end
+	end
+	always@(*)begin
+		theta_d_v1 = theta_d - theta_d_r1;
+		theta_d_v2 = theta_d_r2 - theta_d_r1;
+	end
+	assign theta_d_a = theta_d_v2 - theta_d_v1;
+
+	always @(posedge clk_c or negedge rst_n) begin
+		if(!rst_n)
+			model_u_r <= 0;
+		else if(clk_c)
+			model_u_r <= model_u;
+	end
+	always @(posedge clk_c or negedge rst_n) begin
+		if(!rst_n)
+			model_udot_r <= 0;
+		else if(clk_c)
+			model_udot_r <= model_udot;
+	end
+
+	//SMC_Controller
+	assign theta_dote = theta_dot - model_udot_r;
+	assign theta_e = backsignal - model_u_r;
+	always@(posedge clk_c or negedge rst_n)begin
+		if(!rst_n)
+			theta_dot_r <= 23'd0;
+		else if (clk_c)
+			theta_dot_r <= theta_dot;
+	end
+	always @(posedge clk_c or negedge rst_n) begin
+		if(!rst_n)
+			theta_dote_r <= 0;
+		else if(clk_c)
+			theta_dote_r <= theta_dote;
+	end
+	always @(posedge clk_c or negedge rst_n) begin
+		if(!rst_n)
+			theta_e_r <= 0;
+		else if(clk_c)
+			theta_e_r <= theta_e;
+	end
+
+	/*------------- read ----------- */
+	always @(negedge rdn or negedge rst_n)
+	begin
+		if(!rst_n)
+			begin
+
+			end
+		else
+			begin
+				if(!rdn)
+					begin
+						case (addr)
+							4'd1:
+							begin
+								dataout <= {backsignal[15:0]};
+								// databuf <= {backsignal[31:16]};
+							end
+							4'd2:
+							begin
+								dataout <= databuf;
+							end
+							4'd3:
+							begin
+								dataout <= {insignal[15:0]};
+								//insignalbuf <= {insignal[31:16]};
+							end
+							4'd4: dataout <= insignalbuf;
+
+							4'd5: dataout <= {{15'd0},start};
+							4'd6: dataout <= rateout;
+							4'd11:
+							begin
+								dataout <= debug[15:0];
+								debugbuf <= debug[31:16];
+							end
+							4'd12: dataout <= debugbuf;
+							default:;
+						endcase
+					end
+			end
+	end
+	/*------------- for debug --------- */
+	`ifdef DEBUG
+	always@(*)
+	begin
+		debug[15:0] = rataout;
+	end
+	`endif
+
+	/*-------------- main -----------*/
+	always@(posedge clk_l or posedge clk_h or negedge rst_n or negedge wrn)begin
+		if(rst_n)begin
+			status<=  8'd0;
+
+
+			error_cnt <= 16'd0;
+		end
+		else if(!wrn)begin
+			case(addr)
+				4'd1:;
+				4'd2:;
+				4'd3:;
+				4'd4:;
+				4'd5:
+				begin
+					case(indata)
+						16'd0:
+						begin
+							start <= 1'd0;
+							rdfifobegin <= 1'd0;
+							pul_enable_out <= 1'd0;
+						end
+						16'd1:
+						begin
+							start <=1'd1;
+							rdfifobegin <= 1'd1;
+							pul_enable_out <=1'd1;
+						end
+						default:;
+					endcase
+				end
+				default:;
+			endcase
+		end
+		else if(clk_l)
+			if(status == 8'd0)
+				status <= 8'd1;
+			else
+				error_cnt <= error_cnt +1'd1;
+		else if(clk_h)begin
+			case(status)
+				8'd1:
+				begin
+					if(rdfifobegin)
+						begin
+							rd_clk <= 1'd1;
+							status <= status +1'd1;
+						end
+					else status <= 8'd9;
+				end
+				8'd2:
+				begin
+					db_fifo <= rddata;
+					used_info <= usedfifo;
+					rd_empty <= rdempty;
+					status <= status + 1'd1;
+				end
+				8'd3:
+				begin
+					if(fifo_no_empty)
+						theta_d[15:0] <= db_fifo;
+					else
+						theta_d[15:0] <= theta_d;
+					rd_clk <= 1'd0;
+					status <= status + 1'd1;
+				end
+				8'd4:
+				begin
+					if(rd_empty == 1'd0)
+						fifo_no_empty <= 1'd1;
+					else
+						fifo_no_empty <= 1'd0;
+					status <= status + 1'd1;
+				end
+				8'd5:
+				begin
+					outaddr_out <= 4'd1;
+					cs_code_out <= 1'd0;
+					status <= status + 1'd1;
+				end
+				8'd6:
+				begin
+					rd_code_out <= 1'd0;
+					status <= status +1'd1;
+				end
+				8'd7: status <= status + 1'd1;
+				8'd8:
+				begin
+					cs_code_out <= 1'd1;
+					rd_code_out <= 1'd1;
+					status <= status +1'd1;
+				end
+				8'd9:
+				begin
+					outaddr_out <= 4'd2;
+					cs_code_out <= 1'd0;
+					status <= status +1'd1;
+				end
+				8'd10:
+				begin
+					rd_code_out <= 1'd0;
+					status <= status + 1'd1;
+				end
+				8'd11:
+				begin
+					lowdata <= backdata;
+					status <= status +1'd1;
+				end
+				8'd12:
+				begin
+					rd_code_out <= 1'd1;
+					cs_code_out <= 1'd1;
+					status <= status +1'd1;
+				end
+				8'd13:
+				begin
+					outaddr_out <= 4'd3;
+					cs_code_out <= 1'd0;
+					status <= status +1'd1;
+				end
+				8'd14:
+				begin
+					rd_code_out <= 1'd0;
+					status <= status + 1'd1;
+				end
+				8'd15:
+				begin
+					highdata <= (backdata& 4'h1);
+					status <= status + 1'd1;
+				end
+				8'd16:
+				begin
+					tama_temp[14:0] <= {highdata[0],lowdata[15:2]};
+					status <= status + 1'd1;
+				end
+				8'd17:
+				begin
+					if(((tama_temp<15'd100 && tama_temp_r > 15'd32567)||(tama_temp_r<15'd100 && tama_temp > 15'd32567)) && backsignal[15] == 0)
+						backsignal[15] <= 1;
+					else if(((tama_temp<15'd100 && tama_temp_r > 15'd32567)||(tama_temp_r<15'd100 && tama_temp > 15'd32567)) && backsignal[15] == 1)
+						backsignal[15] <= 0;
+					status <= status + 1'd1;
+				end
+				8'd18:
+				begin
+					tama_temp_r <= tama_temp;
+					rd_code_out <= 1'd1;
+					cs_code_out <= 1'd1;
+					backsignal[14:0] <= {highdata[0],lowdata[15:2]};
+					if(start)
+						status <= status +1'd1;
+					else
+						status <= 1'd0;
+				end
+				8'd19:
+				begin
+					clk_c <= 1'd1;
+					status <= status + 1'd1;
+				end
+				8'd20,8'd21,8'd22,8'd23,8'd24,8'd25,8'd26,8'd27,8'd28,8'd29,8'd30:
+				status <= status + 1'd1;
+				8'd31:
+				begin
+					if(controller_u >= 32'd2000 && controller_u < 32'h80000000)
+						u <= 32'd2000;
+					else if (controller_u >= 32'h80000000 && controller_u <= 32'hFFFFF830)
+						u<= 32'hFFFFF830;
+					else
+						u<= controller_u;
+					status <= status +1'd1;
+				end
+				8'd32:
+				begin
+					rateout <= 16'd5000 - {u[15:0]};
+					status <= status + 1'd1;
+				end
+				8'd32:
+				begin
+					outaddr_out <= 4'd1;
+					status <= status + 1'd1;
+				end
+				8'd33:
+				begin
+					cs_rate_out <= 1'd0;
+					status <= status + 1'd1;
+				end
+				8'd34:
+				begin
+					wr_rate_out <= 1'd0;
+					status <= status + 1'd1;
+				end
+				8'd35:
+				begin
+					wr_rate_out <= 1'd1;
+					status <= status + 1'd1;
+				end
+				8'd36:
+				begin
+					cs_rate_out <= 1'd1;
+					status <= 8'd40;
+				end
+
+				8'd40:
+				begin
+					clk_c <= 1'd0;
+					status <= 8'd0;
+				end
+
+				default status<=8'd0;
+			endcase
+		end
+	end
+
+	assign rd_code = rd_code_out;
+	assign outaddr = outaddr_out;
+	assign wr_rate = wr_rate_out;
+	assign cs_code = cs_code_out;
+	assign cs_rate = cs_rate_out;
+	assign pul_enable = pul_enable_out;
+	assign rate = rateout;
+
+	assign rdreq = rd_req;
+	assign rdclk = rd_clk;
+	assign fifoclr = fifo_clr;
+	assign outdata = !rdn ? dataout : 16'hzzzz;
+endmodule
